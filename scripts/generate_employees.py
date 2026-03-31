@@ -132,6 +132,6 @@ with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
     writer.writeheader()
     writer.writerows(rows)
 
-print(f"✅  Generated {len(rows)} rows → {OUTPUT_FILE}")
+print(f"  Generated {len(rows)} rows → {OUTPUT_FILE}")
 print(f"   Duplicates injected : {len(duplicates)}")
 print(f"   Total unique IDs    : {TOTAL_RECORDS}")
