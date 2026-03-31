@@ -24,6 +24,7 @@ An end-to-end data engineering pipeline using **Apache Spark**, **PostgreSQL**, 
 
 ```
 employee-pipeline/
+├── demo.mkv
 ├── docker-compose.yml              # Orchestrates Spark + PostgreSQL
 ├── drivers/
 │   └── postgresql-42.7.3.jar       # JDBC driver (download via script)
@@ -120,10 +121,7 @@ You should see `database system is ready to accept connections`.
 ### Step 6 – Run the Spark pipeline
 
 ```bash
-docker exec spark_master \
-  spark-submit \
-  --jars /opt/spark-drivers/postgresql-42.7.3.jar \
-  /opt/spark-jobs/employee_pipeline.py
+docker exec spark_master /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark-drivers/postgresql-42.7.3.jar /opt/spark-jobs/employee_pipeline.py
 ```
 
 The job will log progress and finish with:
@@ -133,19 +131,9 @@ The job will log progress and finish with:
 
 ### Step 7 – Verify results
 
-Connect to PostgreSQL and run verification queries:
-
-```bash
-docker exec -it employee_postgres \
-  psql -U admin -d employee_db -f /dev/stdin < sql/verify_data.sql
-```
-
-Or open an interactive session:
 ```bash
 docker exec -it employee_postgres psql -U admin -d employee_db
 ```
-
-Then paste queries from `sql/verify_data.sql`.
 
 ### Step 8 – Spark Web UI (optional)
 
@@ -254,11 +242,6 @@ SELECT COUNT(*) FROM employees_clean WHERE hire_date > CURRENT_DATE;  -- expect 
 SELECT employee_id, COUNT(*) FROM employees_clean
 GROUP BY employee_id HAVING COUNT(*) > 1;                             -- expect 0 rows
 
--- Salary band distribution
-SELECT * FROM salary_band_distribution;
-
--- Department summary
-SELECT * FROM dept_salary_summary;
 ```
 
 ---
