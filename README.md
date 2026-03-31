@@ -25,6 +25,10 @@ An end-to-end data engineering pipeline using **Apache Spark**, **PostgreSQL**, 
 ```
 employee-pipeline/
 ├── demo.mkv
+├── cleaned_data.png
+├── created database,table and view.png
+├── docker containerup.png
+├── spark web UI.png
 ├── docker-compose.yml              # Orchestrates Spark + PostgreSQL
 ├── drivers/
 │   └── postgresql-42.7.3.jar       # JDBC driver (download via script)
