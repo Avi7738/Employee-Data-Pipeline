@@ -1,13 +1,13 @@
 import os
-import re
 import logging
 from datetime import date
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, DecimalType, DateType
+from pyspark.sql.window import Window
+from pyspark.sql.types import IntegerType, DecimalType
 
-# Logging setup 
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -15,6 +15,7 @@ logging.basicConfig(
 log = logging.getLogger("EmployeePipeline")
 
 # Config
+
 PG_HOST     = os.getenv("PG_HOST",     "postgres")
 PG_PORT     = os.getenv("PG_PORT",     "5432")
 PG_DB       = os.getenv("PG_DB",       "employee_db")
@@ -23,12 +24,12 @@ PG_PASSWORD = os.getenv("PG_PASSWORD", "admin123")
 
 JDBC_URL    = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
 JDBC_DRIVER = "org.postgresql.Driver"
-
 INPUT_CSV   = "/opt/spark-data/employees_raw.csv"
-TODAY       = date.today().isoformat()      # e.g. "2026-03-30"
+TODAY       = date.today().isoformat()
 
-# Spark session
+EMAIL_REGEX = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
 
+# Step 1: Spark Session
 def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
@@ -37,82 +38,67 @@ def create_spark_session() -> SparkSession:
         .getOrCreate()
     )
 
-# Step 1: Read raw CSV
-
+# Step 2: Read raw CSV
 def read_raw(spark: SparkSession) -> DataFrame:
     log.info("Reading raw CSV: %s", INPUT_CSV)
     df = (
         spark.read
-        .option("header", "true")
-        .option("inferSchema", "false")   # keep everything as string initially
-        .option("multiLine", "true")      # handles quoted fields with commas
-        .option("escape", '"')
+        .option("header",    "true")
+        .option("inferSchema", "false")
+        .option("multiLine", "true")
+        .option("escape",    '"')
         .csv(INPUT_CSV)
     )
     log.info("Raw record count: %d", df.count())
     return df
 
-# Step 2: Data Quality – flag bad rows 
-
-EMAIL_REGEX = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
-
+# Step 3: Data Quality Flags
 def apply_quality_flags(df: DataFrame) -> DataFrame:
     """
     Adds boolean flag columns:
-      _missing_critical  – required fields are null / empty
-      _duplicate         – employee_id appears more than once (keep first)
-      _invalid_email     – email does not match RFC-ish pattern
-      _future_hire_date  – hire_date is in the future
+      _missing_critical  - required fields are null/empty
+      _duplicate         - employee_id OR email appears more than once (keep first)
+      _invalid_email     - email does not match valid format
+      _future_hire_date  - hire_date is in the future
     """
-    log.info("Applying data-quality flags …")
+    log.info("Applying data-quality flags ...")
 
-    # 2a. Missing critical fields 
+    # 3a. Missing critical fields
     df = df.withColumn(
         "_missing_critical",
-        F.col("employee_id").isNull()
-        | (F.trim(F.col("employee_id")) == "")
-        | F.col("first_name").isNull()
-        | (F.trim(F.col("first_name")) == "")
-        | F.col("last_name").isNull()
-        | (F.trim(F.col("last_name")) == "")
-        | F.col("email").isNull()
-        | (F.trim(F.col("email")) == "")
-        | F.col("hire_date").isNull()
-        | (F.trim(F.col("hire_date")) == ""),
+        F.col("employee_id").isNull() | (F.trim(F.col("employee_id")) == "")
+        | F.col("first_name").isNull()  | (F.trim(F.col("first_name")) == "")
+        | F.col("last_name").isNull()   | (F.trim(F.col("last_name")) == "")
+        | F.col("email").isNull()       | (F.trim(F.col("email")) == "")
+        | F.col("hire_date").isNull()   | (F.trim(F.col("hire_date")) == ""),
     )
 
-    # 2b. Duplicate employee_id (flag all but the first occurrence)
-    from pyspark.sql.window import Window
-    win = Window.partitionBy("employee_id").orderBy(F.monotonically_increasing_id())
-    df = df.withColumn("_row_num", F.row_number().over(win))
-    df = df.withColumn("_duplicate", F.col("_row_num") > 1).drop("_row_num")
+    # 3b. Duplicate employee_id - keep first occurrence only
+    win_id = Window.partitionBy("employee_id").orderBy(F.monotonically_increasing_id())
+    df = df.withColumn("_rn_id", F.row_number().over(win_id))
+    df = df.withColumn("_dup_id", F.col("_rn_id") > 1).drop("_rn_id")
 
-    # 2c. Invalid email
-    df = df.withColumn(
-        "_invalid_email",
-        ~F.col("email").rlike(EMAIL_REGEX),
-    )
+    # 3c. Duplicate email (normalise to lowercase first) - keep first occurrence only
+    df = df.withColumn("_email_norm", F.lower(F.trim(F.col("email"))))
+    win_email = Window.partitionBy("_email_norm").orderBy(F.monotonically_increasing_id())
+    df = df.withColumn("_rn_email", F.row_number().over(win_email))
+    df = df.withColumn("_dup_email", F.col("_rn_email") > 1).drop("_rn_email", "_email_norm")
 
-    # 2d. Future hire date
-    df = df.withColumn(
-        "_hire_date_parsed",
-        F.to_date(F.col("hire_date"), "yyyy-MM-dd"),
-    )
-    df = df.withColumn(
-        "_future_hire_date",
-        F.col("_hire_date_parsed") > F.lit(TODAY),
-    )
+    # Combined duplicate flag
+    df = df.withColumn("_duplicate", F.col("_dup_id") | F.col("_dup_email")) \
+           .drop("_dup_id", "_dup_email")
+
+    # 3d. Invalid email format
+    df = df.withColumn("_invalid_email", ~F.col("email").rlike(EMAIL_REGEX))
+
+    # 3e. Future hire date
+    df = df.withColumn("_hire_date_parsed", F.to_date(F.col("hire_date"), "yyyy-MM-dd"))
+    df = df.withColumn("_future_hire_date", F.col("_hire_date_parsed") > F.lit(TODAY))
 
     return df
 
-# Step 3: Split clean vs rejected 
-
+# Step 4: Split clean vs rejected
 def split_clean_rejected(df: DataFrame):
-    """
-    Returns (clean_df, rejected_df).
-    A row is rejected if it has a missing critical field, is a duplicate,
-    has an invalid email, OR has a future hire date.
-    """
     reject_cond = (
         F.col("_missing_critical")
         | F.col("_duplicate")
@@ -120,12 +106,14 @@ def split_clean_rejected(df: DataFrame):
         | F.col("_future_hire_date")
     )
 
+    raw_cols = [c for c in df.columns if not c.startswith("_")]
+
     rejected = df.filter(reject_cond).select(
-        F.concat_ws("|", *[c for c in df.columns if not c.startswith("_")]).alias("raw_data"),
-        F.when(F.col("_missing_critical"),  "Missing critical field")
-         .when(F.col("_duplicate"),         "Duplicate employee_id")
-         .when(F.col("_invalid_email"),     "Invalid email format")
-         .when(F.col("_future_hire_date"),  "Future hire date")
+        F.concat_ws("|", *raw_cols).alias("raw_data"),
+        F.when(F.col("_missing_critical"), "Missing critical field")
+         .when(F.col("_duplicate"),        "Duplicate employee_id or email")
+         .when(F.col("_invalid_email"),    "Invalid email format")
+         .when(F.col("_future_hire_date"), "Future hire date")
          .otherwise("Multiple issues").alias("reject_reason"),
     )
 
@@ -138,81 +126,65 @@ def split_clean_rejected(df: DataFrame):
     log.info("Rejected rows: %d", rejected.count())
     return clean, rejected
 
-# Step 4: Transformations
-
-def clean_salary(salary_col):
-    """Strips $, commas → numeric string → cast to Decimal."""
-    return (
-        F.regexp_replace(
-            F.regexp_replace(salary_col, r"[\$,]", ""),
-            r"\s+", ""
-        )
-    )
-
-
-def salary_band(salary_col):
-    """Junior < 50k | Mid 50k–80k | Senior > 80k."""
-    return (
-        F.when(salary_col < 50_000, "Junior")
-         .when(salary_col <= 80_000, "Mid")
-         .otherwise("Senior")
-    )
-
-
+# Step 5: Transformations
 def apply_transformations(df: DataFrame) -> DataFrame:
-    log.info("Applying transformations …")
+    log.info("Applying transformations ...")
 
-    # Name standardisation (Proper Case)
+    # Name standardisation - Proper Case
     df = (
         df
         .withColumn("first_name", F.initcap(F.trim(F.col("first_name"))))
         .withColumn("last_name",  F.initcap(F.trim(F.col("last_name"))))
     )
 
-    # Email → lowercase
+    # Email - lowercase
     df = df.withColumn("email", F.lower(F.trim(F.col("email"))))
 
-    # Salary cleaning → Decimal 
+    # Salary - strip $, commas -> Decimal
     df = (
         df
-        .withColumn("salary_str",    clean_salary(F.col("salary")))
-        .withColumn("salary",
-                    F.col("salary_str").cast(DecimalType(10, 2)))
+        .withColumn("salary_str",
+                    F.regexp_replace(F.regexp_replace(F.col("salary"), r"[\$,]", ""), r"\s+", ""))
+        .withColumn("salary", F.col("salary_str").cast(DecimalType(10, 2)))
         .drop("salary_str")
     )
 
     # Salary band
-    df = df.withColumn("salary_band", salary_band(F.col("salary")))
+    df = df.withColumn(
+        "salary_band",
+        F.when(F.col("salary") < 50000,  "Junior")
+         .when(F.col("salary") <= 80000, "Mid")
+         .otherwise("Senior"),
+    )
 
-    # Date columns → proper DateType
+    # Date columns
     df = (
         df
         .withColumn("hire_date",  F.to_date(F.col("hire_date"),  "yyyy-MM-dd"))
         .withColumn("birth_date", F.to_date(F.col("birth_date"), "yyyy-MM-dd"))
     )
 
-    # Age calculation (years from birth_date to today)
+    # Age (years from birth_date to today)
     df = df.withColumn(
         "age",
-        F.floor(F.datediff(F.current_date(), F.col("birth_date")) / 365.25)
-         .cast(IntegerType()),
+        F.floor(F.datediff(F.current_date(), F.col("birth_date")) / 365.25).cast(IntegerType()),
     )
 
-    # Tenure calculation (years from hire_date to today)
+    # Tenure (years from hire_date to today)
     df = df.withColumn(
         "tenure_years",
         F.round(F.datediff(F.current_date(), F.col("hire_date")) / 365.25, 1)
          .cast(DecimalType(3, 1)),
     )
 
-    # Department / status normalisation
+    # Normalise department and status
     df = (
         df
         .withColumn("department", F.initcap(F.trim(F.lower(F.col("department")))))
         .withColumn("status",     F.initcap(F.trim(F.lower(F.col("status")))))
     )
 
-    # Numeric cast for IDs
+    # Cast numeric IDs
     df = (
         df
         .withColumn("employee_id", F.col("employee_id").cast(IntegerType()))
@@ -221,27 +193,19 @@ def apply_transformations(df: DataFrame) -> DataFrame:
 
     return df
 
-# Step 5: Enrichment 
-
+# Step 6: Enrichment
 def apply_enrichment(df: DataFrame) -> DataFrame:
-    log.info("Adding enrichment columns …")
+    log.info("Adding enrichment columns ...")
 
-    # full_name
-    df = df.withColumn(
-        "full_name",
-        F.concat_ws(" ", F.col("first_name"), F.col("last_name")),
-    )
+    df = df.withColumn("full_name",
+                       F.concat_ws(" ", F.col("first_name"), F.col("last_name")))
 
-    # email_domain  (part after @)
-    df = df.withColumn(
-        "email_domain",
-        F.regexp_extract(F.col("email"), r"@(.+)$", 1),
-    )
+    df = df.withColumn("email_domain",
+                       F.regexp_extract(F.col("email"), r"@(.+)$", 1))
 
     return df
 
-# Step 6: Select final columns in DB order 
-
+# Step 7: Select final columns
 FINAL_COLUMNS = [
     "employee_id", "first_name", "last_name", "full_name",
     "email", "email_domain", "hire_date", "job_title", "department",
@@ -253,10 +217,15 @@ FINAL_COLUMNS = [
 def select_final(df: DataFrame) -> DataFrame:
     return df.select(*FINAL_COLUMNS)
 
-# Step 7: Write to PostgreSQL
-
-def write_to_postgres(df: DataFrame, table: str, mode: str = "append") -> None:
-    log.info("Writing %d rows to table '%s' …", df.count(), table)
+# Step 8: Write to PostgreSQL (IDEMPOTENT - overwrite on every run)
+def write_to_postgres(df: DataFrame, table: str) -> None:
+    """
+    Clears the table and re-inserts all rows on every run.
+    truncate=true preserves the table DDL (indexes, constraints, views).
+    mode=overwrite triggers the truncate-then-insert behaviour in Spark JDBC.
+    Running this job 10 times produces the same result as running it once.
+    """
+    log.info("Writing %d rows to '%s' (truncate + insert) ...", df.count(), table)
     (
         df.write
         .format("jdbc")
@@ -265,47 +234,31 @@ def write_to_postgres(df: DataFrame, table: str, mode: str = "append") -> None:
         .option("user",     PG_USER)
         .option("password", PG_PASSWORD)
         .option("driver",   JDBC_DRIVER)
-        .mode(mode)
+        .option("truncate", "true")   # TRUNCATE rows, keep DDL/indexes/constraints
+        .mode("overwrite")
         .save()
     )
-    log.info("✅  Write to '%s' complete.", table)
+    log.info("Write to '%s' complete.", table)
 
 # Main
-
 def main():
     log.info("=== Employee Data Pipeline starting ===")
     spark = create_spark_session()
 
     try:
-        # 1. Read
-        raw_df = read_raw(spark)
-
-        # 2. Quality flags
-        flagged_df = apply_quality_flags(raw_df)
-
-        # 3. Split
+        raw_df        = read_raw(spark)
+        flagged_df    = apply_quality_flags(raw_df)
         clean_df, rejected_df = split_clean_rejected(flagged_df)
-
-        # 4. Transform
         transformed_df = apply_transformations(clean_df)
-
-        # 5. Enrich
-        enriched_df = apply_enrichment(transformed_df)
-
-        # 6. Final column selection
-        final_df = select_final(enriched_df)
-        final_df = final_df.dropDuplicates(["employee_id"])
+        enriched_df   = apply_enrichment(transformed_df)
+        final_df      = select_final(enriched_df)
         final_df.cache()
 
-        # 7. Show sample for verification
         log.info("Sample output (5 rows):")
         final_df.show(5, truncate=False)
 
-        # 8. Write clean data
-        write_to_postgres(final_df, "employees_clean", mode="append")
-
-        # 9. Write rejected data
-        write_to_postgres(rejected_df, "employees_rejected", mode="append")
+        write_to_postgres(final_df,    "employees_clean")
+        write_to_postgres(rejected_df, "employees_rejected")
 
         log.info("=== Pipeline finished successfully ===")
 
