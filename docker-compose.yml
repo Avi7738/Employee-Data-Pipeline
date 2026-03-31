@@ -1,0 +1,78 @@
+version: "3.8"
+
+services:
+  # ─────────────────────────────────────────────
+  # PostgreSQL Database
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: employee_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: employee_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql   # auto-runs on first start
+    networks:
+      - pipeline_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d employee_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # Apache Spark Master
+  # ─────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark_master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master   # ✅ ADD THIS
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"   # Spark Web UI
+      - "7077:7077"   # Spark Master port
+    volumes:
+      - ./spark:/opt/spark-jobs          # Spark job scripts
+      - ./data:/opt/spark-data           # Input / output data
+      - ./drivers:/opt/spark-drivers     # JDBC JAR
+    networks:
+      - pipeline_net
+
+  # ─────────────────────────────────────────────
+  # Apache Spark Worker
+  # ─────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077   # ✅ ADD THIS
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - ./data:/opt/spark-data
+      - ./drivers:/opt/spark-drivers
+    networks:
+      - pipeline_net
+
+volumes:
+  postgres_data:
+
+networks:
+  pipeline_net:
+    driver: bridge
