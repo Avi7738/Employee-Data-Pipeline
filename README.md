@@ -171,8 +171,8 @@ docker-compose down -v        # stop AND delete the PostgreSQL data volume
 | Service | Image | Ports |
 |---------|-------|-------|
 | `postgres` | `postgres:15` | 5432 |
-| `spark-master` | `bitnami/spark:3.5` | 8080, 7077 |
-| `spark-worker` | `bitnami/spark:3.5` | — |
+| `spark-master` | `apache/spark:3.5.0` | 8080, 7077 |
+| `spark-worker` | `apache/spark:3.5.0` | — |
 
 All services share the `pipeline_net` bridge network so Spark can reach PostgreSQL at hostname `postgres`.
 
